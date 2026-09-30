@@ -1,8 +1,10 @@
 package github_ratelimit
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"sync"
@@ -318,5 +320,87 @@ func TestConfigOverride(t *testing.T) {
 	}
 	if preOverride.Load() {
 		t.Fatal("default callback was called instead of override")
+	}
+}
+
+func TestPrimaryRateLimitRetryAfterReset(t *testing.T) {
+	t.Parallel()
+	const every = 1 * time.Second
+	const injected = 1 * time.Second
+
+	var detected atomic.Int64
+	category := github_primary_ratelimit.ResourceCategoryCore
+	i := github_ratelimit_test.SetupPrimaryInjecter(t, every, injected, category)
+	c := github_ratelimit_test.NewPrimaryClient(i,
+		github_primary_ratelimit.WithRetryAfterReset(),
+		github_primary_ratelimit.WithLimitDetectedCallback(func(*github_primary_ratelimit.CallbackContext) {
+			detected.Add(1)
+		}),
+	)
+
+	if _, err := c.Get("/trigger-core-category"); err != nil {
+		t.Fatalf("expecting first request to succeed, got %v", err)
+	}
+
+	github_ratelimit_test.WaitForNextSleep(i)
+
+	// The limit is in force: without retrying this is the request that fails.
+	start := time.Now()
+	resp, err := c.Get("/trigger-core-category")
+	if err != nil {
+		t.Fatalf("expecting the request to wait for the reset and succeed, got %v", err)
+	}
+
+	// A real response rather than the one the limiter synthesises for a refusal.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := string(body); got != "some response" {
+		t.Fatalf("expecting the upstream response body, got %q", got)
+	}
+
+	// And it got there by waiting rather than by the limit never applying.
+	if elapsed := time.Since(start); elapsed < injected/2 {
+		t.Fatalf("expecting the request to wait about %v for the reset, waited %v", injected, elapsed)
+	}
+
+	// The callback is still the caller's, rather than being spent on sleeping.
+	if detected.Load() == 0 {
+		t.Fatal("expecting the limit-detected callback to have been called")
+	}
+}
+
+func TestPrimaryRateLimitRetryAfterResetHonoursContext(t *testing.T) {
+	t.Parallel()
+	const every = 1 * time.Second
+	const injected = 1 * time.Hour
+
+	category := github_primary_ratelimit.ResourceCategoryCore
+	i := github_ratelimit_test.SetupPrimaryInjecter(t, every, injected, category)
+	c := github_ratelimit_test.NewPrimaryClient(i, github_primary_ratelimit.WithRetryAfterReset())
+
+	if _, err := c.Get("/trigger-core-category"); err != nil {
+		t.Fatalf("expecting first request to succeed, got %v", err)
+	}
+
+	github_ratelimit_test.WaitForNextSleep(i)
+
+	// An hour's wait must not outlast the caller's patience.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/trigger-core-category", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if _, err := c.Do(req); err == nil {
+		t.Fatal("expecting the request to end with the context, got no error")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("expecting the context to end the wait promptly, waited %v", elapsed)
 	}
 }
