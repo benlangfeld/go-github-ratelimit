@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,5 +403,82 @@ func TestPrimaryRateLimitRetryAfterResetHonoursContext(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Fatalf("expecting the context to end the wait promptly, waited %v", elapsed)
+	}
+}
+
+// alwaysLimited answers every request with a rate limit that names no reset
+// time, which parses as the epoch and so is always already past.
+type alwaysLimited struct {
+	calls atomic.Int64
+}
+
+func (a *alwaysLimited) RoundTrip(_ *http.Request) (*http.Response, error) {
+	a.calls.Add(1)
+
+	header := http.Header{}
+	header.Set("x-ratelimit-remaining", "0")
+	header.Set("x-ratelimit-resource", string(github_primary_ratelimit.ResourceCategoryCore))
+
+	return &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(`{"message":"API rate limit exceeded"}`)),
+	}, nil
+}
+
+// A reset that is not in the future gives nothing to wait for, so retrying must
+// not turn into a tight loop against a limit that never lifts.
+func TestPrimaryRateLimitRetryAfterResetIsBounded(t *testing.T) {
+	t.Parallel()
+
+	base := &alwaysLimited{}
+	c := &http.Client{Transport: github_primary_ratelimit.New(base, github_primary_ratelimit.WithRetryAfterReset())}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Get("/trigger-core-category")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expecting a rate limit error once retrying gives up")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("expecting retries to stop, sent %d requests and still going", base.calls.Load())
+	}
+
+	if got := base.calls.Load(); got > 4 {
+		t.Fatalf("expecting at most 4 requests, sent %d", got)
+	}
+}
+
+// WithBypassLimit asks for no request to be prevented, which a wait would
+// contradict, so it takes precedence over WithRetryAfterReset.
+func TestPrimaryRateLimitBypassIsNotDelayedByRetryAfterReset(t *testing.T) {
+	t.Parallel()
+	const every = 1 * time.Second
+	const injected = 1 * time.Hour
+
+	category := github_primary_ratelimit.ResourceCategoryCore
+	i := github_ratelimit_test.SetupPrimaryInjecter(t, every, injected, category)
+	c := github_ratelimit_test.NewPrimaryClient(i,
+		github_primary_ratelimit.WithRetryAfterReset(),
+		github_primary_ratelimit.WithBypassLimit(),
+	)
+
+	if _, err := c.Get("/trigger-core-category"); err != nil {
+		t.Fatalf("expecting first request to succeed, got %v", err)
+	}
+
+	github_ratelimit_test.WaitForNextSleep(i)
+
+	start := time.Now()
+	if _, err := c.Get("/trigger-core-category"); err == nil {
+		t.Fatal("expecting the bypassed request to reach the limited upstream")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("expecting the request not to wait for the reset, waited %v", elapsed)
 	}
 }

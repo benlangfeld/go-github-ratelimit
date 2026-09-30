@@ -73,8 +73,13 @@ func WithSleepUntilReset() Option {
 // rather than one sleeping while the rest fail.
 //
 // The wait honours the request's context: a cancelled or expired context ends
-// it and returns the context's error. A request carrying a body that cannot be
-// rewound is not retried, since resending it is not safe.
+// it and returns the context's error. Give long waits a context deadline if the
+// caller has one, since a reset can be an hour away. A request carrying a body
+// that cannot be rewound is not retried, since resending it is not safe.
+//
+// A limit that outlasts several waits is reported as an error rather than
+// waited on indefinitely, and WithBypassLimit takes precedence: a caller asking
+// for no request to be prevented gets the request sent rather than delayed.
 //
 // Unlike WithSleepUntilReset it does not occupy the LimitDetectedCallback, so a
 // caller can still be told when a limit is reached.

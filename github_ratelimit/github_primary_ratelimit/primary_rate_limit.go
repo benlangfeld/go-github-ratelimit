@@ -44,8 +44,16 @@ func New(base http.RoundTripper, opts ...Option) *PrimaryRateLimiter {
 	}
 }
 
+// maxAttempts bounds the number of requests a single RoundTrip may send when
+// WithRetryAfterReset is set. Waiting is only worth doing while the limit is
+// expected to lift: a limit that survives several waits will not be waited out,
+// and a reset time that is missing or already past makes every wait return at
+// once, which without a bound would retry in a tight loop.
+const maxAttempts = 4
+
 func (l *PrimaryRateLimiter) RoundTrip(request *http.Request) (*http.Response, error) {
 	attempt := request
+	attempts := 0
 	for {
 		config := l.getRequestConfig(attempt)
 		category := parseRequestCategory(attempt)
@@ -60,19 +68,22 @@ func (l *PrimaryRateLimiter) RoundTrip(request *http.Request) (*http.Response, e
 				ResetTime:    resetTime.AsTime(),
 			}
 			config.TriggerRequestPrevented(ctx)
-			if config.retryAfterReset {
+			switch {
+			case config.bypassLimit:
+				// the caller asked for no request to be prevented, so send it.
+			case config.retryAfterReset && attempts < maxAttempts:
 				next, err := waitForReset(request, *resetTime.AsTime())
 				if err != nil {
 					return nil, err
 				}
 				attempt = next
 				continue
-			}
-			if !config.bypassLimit {
+			default:
 				return nil, ctx.AsError()
 			}
 		}
 
+		attempts++
 		resp, err := l.Base.RoundTrip(attempt)
 		if err != nil {
 			return resp, err
@@ -90,9 +101,11 @@ func (l *PrimaryRateLimiter) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		config.TriggerLimitReached(callbackContext)
 
-		if config.retryAfterReset {
+		if config.retryAfterReset && attempts < maxAttempts {
+			// the limit this response records is now in the state, so let the
+			// top of the loop wait it out.
 			drainAndClose(resp)
-			next, err := waitForReset(request, *resetTime.AsTime())
+			next, err := rewind(request)
 			if err != nil {
 				return nil, err
 			}
@@ -109,13 +122,18 @@ func (l *PrimaryRateLimiter) RoundTrip(request *http.Request) (*http.Response, e
 var ErrBodyNotRewindable = errors.New("github_primary_ratelimit: request body cannot be rewound, so the request cannot be retried")
 
 // waitForReset sleeps until the limit resets and returns a request that can be
-// sent again. The original is left untouched, since a RoundTripper may not
-// modify the request it was given.
+// sent again.
 func waitForReset(request *http.Request, until time.Time) (*http.Request, error) {
 	if err := sleepUntil(request.Context(), until); err != nil {
 		return nil, err
 	}
+	return rewind(request)
+}
 
+// rewind returns a copy of the request that can be sent again, with a body read
+// from the start. The original is left untouched, since a RoundTripper may not
+// modify the request it was given.
+func rewind(request *http.Request) (*http.Request, error) {
 	next := request.Clone(request.Context())
 	if request.Body == nil || request.Body == http.NoBody {
 		return next, nil
