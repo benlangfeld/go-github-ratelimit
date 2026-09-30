@@ -80,10 +80,10 @@ func (p ParsedResponse) isSecondaryRateLimit() bool {
 
 	rawBody, err := io.ReadAll(p.resp.Body)
 	p.resp.Body.Close()
+	p.resp.Body = io.NopCloser(bytes.NewReader(rawBody))
 	if err != nil {
 		return false
 	}
-	p.resp.Body = io.NopCloser(bytes.NewReader(rawBody))
 
 	var body github_secondary_ratelimit.SecondaryRateLimitBody
 	if err := json.Unmarshal(rawBody, &body); err != nil {
